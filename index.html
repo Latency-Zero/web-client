@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LatZero Fixed Client Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        
+        h1, h2, h3 {
+            color: #333;
+        }
+        
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            font-weight: bold;
+        }
+        
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .status.disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .section {
+            margin-bottom: 30px;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        
+        .form-group {
+            margin-bottom: 15px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        
+        input, button, select {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            cursor: pointer;
+            margin-right: 10px;
+            margin-bottom: 10px;
+        }
+        
+        button:hover {
+            background-color: #0056b3;
+        }
+        
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        
+        .log {
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            padding: 10px;
+            height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+        
+        .result {
+            background-color: #e7f3ff;
+            border: 1px solid #b3d9ff;
+            border-radius: 4px;
+            padding: 10px;
+            margin-top: 10px;
+        }
+        
+        .error {
+            background-color: #ffe6e6;
+            border: 1px solid #ff9999;
+            border-radius: 4px;
+            padding: 10px;
+            margin-top: 10px;
+            color: #cc0000;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        
+        @media (max-width: 768px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <h1>LatZero Fixed Client Demo</h1>
+    <p><strong>Fixed Version:</strong> Uses latzero-web2.js with corrected join_pool message structure for proper process registration in server TUI.</p>
+    
+    <div class="container">
+        <div id="connectionStatus" class="status disconnected">
+            Disconnected from LatZero server
+        </div>
+        
+        <div class="form-group">
+            <button id="connectBtn" onclick="connect()">Connect</button>
+            <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+        </div>
+    </div>
+
+    <div class="grid">
+        <!-- Process Pool Section -->
+        <div class="container">
+            <div class="section">
+                <h3>Process Pool - Add Function (Fixed)</h3>
+                <p>Register and call an 'add' function that takes two numbers</p>
+                
+                <div class="form-group">
+                    <button id="registerAddBtn" onclick="registerAdd()" disabled>Register Add Function</button>
+                </div>
+                
+                <div class="form-group">
+                    <label>Number 1:</label>
+                    <input type="number" id="num1" value="5" placeholder="Enter first number">
+                </div>
+                
+                <div class="form-group">
+                    <label>Number 2:</label>
+                    <input type="number" id="num2" value="3" placeholder="Enter second number">
+                </div>
+                
+                <div class="form-group">
+                    <button id="callAddBtn" onclick="callAdd()" disabled>Call Add Function</button>
+                    <button id="broadcastAddBtn" onclick="broadcastAdd()" disabled>Broadcast Add Function</button>
+                </div>
+                
+                <div id="addResult"></div>
+            </div>
+            
+            <div class="section">
+                <h3>Process Management</h3>
+                <button id="listProcessesBtn" onclick="listProcesses()" disabled>List All Processes</button>
+                <button id="unregisterAddBtn" onclick="unregisterAdd()" disabled>Unregister Add Function</button>
+                <div id="processList"></div>
+            </div>
+        </div>
+
+        <!-- Buffer Operations Section -->
+        <div class="container">
+            <div class="section">
+                <h3>Buffer Operations</h3>
+                
+                <div class="form-group">
+                    <label>Key:</label>
+                    <input type="text" id="bufferKey" placeholder="Enter key">
+                </div>
+                
+                <div class="form-group">
+                    <label>Value:</label>
+                    <input type="text" id="bufferValue" placeholder="Enter value">
+                </div>
+                
+                <div class="form-group">
+                    <button id="setBtn" onclick="setBuffer()" disabled>Set</button>
+                    <button id="getBtn" onclick="getBuffer()" disabled>Get</button>
+                    <button id="deleteBtn" onclick="deleteBuffer()" disabled>Delete</button>
+                    <button id="existsBtn" onclick="existsBuffer()" disabled>Exists</button>
+                </div>
+                
+                <div id="bufferResult"></div>
+            </div>
+            
+            <div class="section">
+                <h3>Buffer Management</h3>
+                <button id="listKeysBtn" onclick="listKeys()" disabled>List All Keys</button>
+                <button id="getStatsBtn" onclick="getStats()" disabled>Get Stats</button>
+                <div id="bufferList"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Event Log Section -->
+    <div class="container">
+        <div class="section">
+            <h3>Event Log</h3>
+            <div id="eventLog" class="log">
+                Waiting for connection...
+            </div>
+            <button onclick="clearLog()" style="margin-top: 10px;">Clear Log</button>
+        </div>
+    </div>
+
+    <!-- Load the FIXED LatZero Web Client -->
+    <script src="latzero-client.js"></script>
+    
+    <script>
+        let client = null;
+        let isConnected = false;
+
+        function log(message, type = 'info') {
+            const logElement = document.getElementById('eventLog');
+            const timestamp = new Date().toLocaleTimeString();
+            const logEntry = `[${timestamp}] ${type.toUpperCase()}: ${message}\n`;
+            logElement.textContent += logEntry;
+            logElement.scrollTop = logElement.scrollHeight;
+        }
+
+        function clearLog() {
+            document.getElementById('eventLog').textContent = '';
+        }
+
+        function updateConnectionStatus(connected) {
+            isConnected = connected;
+            const statusElement = document.getElementById('connectionStatus');
+            const connectBtn = document.getElementById('connectBtn');
+            const disconnectBtn = document.getElementById('disconnectBtn');
+            
+            // Enable/disable all buttons based on connection status
+            const buttons = [
+                'registerAddBtn', 'callAddBtn', 'broadcastAddBtn', 
+                'listProcessesBtn', 'unregisterAddBtn',
+                'setBtn', 'getBtn', 'deleteBtn', 'existsBtn',
+                'listKeysBtn', 'getStatsBtn'
+            ];
+            
+            buttons.forEach(btnId => {
+                const btn = document.getElementById(btnId);
+                if (btn) btn.disabled = !connected;
+            });
+            
+            if (connected) {
+                statusElement.className = 'status connected';
+                statusElement.textContent = 'Connected to LatZero server';
+                connectBtn.disabled = true;
+                disconnectBtn.disabled = false;
+            } else {
+                statusElement.className = 'status disconnected';
+                statusElement.textContent = 'Disconnected from LatZero server';
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+            }
+        }
+
+        function showResult(elementId, content, isError = false) {
+            const element = document.getElementById(elementId);
+            if (isError) {
+                element.innerHTML = `<div class="error">${content}</div>`;
+            } else {
+                element.innerHTML = `<div class="result">${content}</div>`;
+            }
+        }
+
+        async function connect() {
+            try {
+                log('Connecting to LatZero server...');
+                client = new LatZeroWebClient('latzero://demo-client', 'demo-pool', {
+                    host: '127.0.0.1',
+                    port: 14130,
+                    autoConnect: true
+                });
+
+                client.addEventListener('connect', () => {
+                    log('Connected to LatZero server');
+                    updateConnectionStatus(true);
+                });
+
+                client.addEventListener('disconnect', () => {
+                    log('Disconnected from LatZero server');
+                    updateConnectionStatus(false);
+                });
+
+                client.addEventListener('error', (event) => {
+                    log(`Error: ${event.detail.message}`, 'error');
+                });
+
+                client.addEventListener('presence', (event) => {
+                    log(`Presence update: ${JSON.stringify(event.detail)}`);
+                });
+
+                client.addEventListener('bufferUpdate', (event) => {
+                    log(`Buffer update: ${JSON.stringify(event.detail)}`);
+                });
+
+            } catch (error) {
+                log(`Connection failed: ${error.message}`, 'error');
+                showResult('addResult', `Connection failed: ${error.message}`, true);
+            }
+        }
+
+        async function disconnect() {
+            if (client) {
+                try {
+                    client.disconnect();
+                    log('Disconnected from server');
+                } catch (error) {
+                    log(`Disconnect error: ${error.message}`, 'error');
+                }
+            }
+        }
+
+        // Process Pool Functions
+        async function registerAdd() {
+            try {
+                log('Registering add function...');
+                
+                // Define the add function
+                const addFunction = function(data) {
+                    // Handle both {a, b} and {x, y} formats for compatibility
+                    const a = data.a !== undefined ? data.a : data.x;
+                    const b = data.b !== undefined ? data.b : data.y;
+                    log(`Add function called with ${a} and ${b}, returning ${a + b}`);
+                    return a + b;
+                };
+                
+                await client.process.register(addFunction, 'add');
+                log('Add function registered successfully');
+                log('Process ID: ' + client.clientId + ':add');
+                showResult('addResult', 'Add function registered successfully!<br>Process ID: ' + client.clientId + ':add');
+                
+                // Verify registration by listing processes
+                setTimeout(async () => {
+                    try {
+                        const processes = await client.process.list();
+                        log('Current processes: ' + processes.join(', '));
+                        if (processes.length > 0) {
+                            log('SUCCESS: Process is now visible in server TUI!');
+                        }
+                    } catch (err) {
+                        log('Failed to verify registration: ' + err.message, 'error');
+                    }
+                }, 1000);
+                
+            } catch (error) {
+                log(`Failed to register add function: ${error.message}`, 'error');
+                showResult('addResult', `Failed to register: ${error.message}`, true);
+            }
+        }
+
+        async function callAdd() {
+            try {
+                const num1 = parseFloat(document.getElementById('num1').value);
+                const num2 = parseFloat(document.getElementById('num2').value);
+                
+                if (isNaN(num1) || isNaN(num2)) {
+                    showResult('addResult', 'Please enter valid numbers', true);
+                    return;
+                }
+                
+                const processId = `${client.clientId}:add`;
+                log(`Calling add function with ${num1} and ${num2}`);
+                log(`Process ID: ${processId}`);
+                
+                const result = await client.process.call(processId, { a: num1, b: num2 });
+                log(`Add result: ${result.payload.value}`);
+                showResult('addResult', `${num1} + ${num2} = ${result.payload.value}<br><small>Called process: ${processId}</small>`);
+            } catch (error) {
+                log(`Failed to call add function: ${error.message}`, 'error');
+                showResult('addResult', `Failed to call: ${error.message}<br><small>Make sure add function is registered first!</small>`, true);
+            }
+        }
+
+        async function broadcastAdd() {
+            try {
+                const num1 = parseFloat(document.getElementById('num1').value);
+                const num2 = parseFloat(document.getElementById('num2').value);
+                
+                if (isNaN(num1) || isNaN(num2)) {
+                    showResult('addResult', 'Please enter valid numbers', true);
+                    return;
+                }
+                
+                log(`Broadcasting add function with ${num1} and ${num2}`);
+                
+                const invokedProcesses = await client.process.broadcast('add', { a: num1, b: num2 });
+                log(`Broadcast invoked ${invokedProcesses.length} processes: ${invokedProcesses.join(', ')}`);
+                showResult('addResult', `Broadcast sent to ${invokedProcesses.length} processes: ${invokedProcesses.join(', ')}`);
+            } catch (error) {
+                log(`Failed to broadcast add function: ${error.message}`, 'error');
+                showResult('addResult', `Failed to broadcast: ${error.message}`, true);
+            }
+        }
+
+        async function listProcesses() {
+            try {
+                log('Listing all processes...');
+                const processes = await client.process.list();
+                log(`Found ${processes.length} processes: ${processes.join(', ')}`);
+                
+                if (processes.length === 0) {
+                    showResult('processList', 'No processes found');
+                } else {
+                    const listHtml = processes.map(p => `<div>• ${p}</div>`).join('');
+                    showResult('processList', `<strong>Registered Processes:</strong><br>${listHtml}`);
+                }
+            } catch (error) {
+                log(`Failed to list processes: ${error.message}`, 'error');
+                showResult('processList', `Failed to list: ${error.message}`, true);
+            }
+        }
+
+        async function unregisterAdd() {
+            try {
+                log('Unregistering add function...');
+                await client.process.unregister('add');
+                log('Add function unregistered successfully');
+                showResult('addResult', 'Add function unregistered successfully!');
+            } catch (error) {
+                log(`Failed to unregister add function: ${error.message}`, 'error');
+                showResult('addResult', `Failed to unregister: ${error.message}`, true);
+            }
+        }
+
+        // Buffer Operations
+        async function setBuffer() {
+            try {
+                const key = document.getElementById('bufferKey').value;
+                const value = document.getElementById('bufferValue').value;
+                
+                if (!key || !value) {
+                    showResult('bufferResult', 'Please enter both key and value', true);
+                    return;
+                }
+                
+                log(`Setting buffer: ${key} = ${value}`);
+                await client.set(key, value);
+                log(`Buffer set successfully`);
+                showResult('bufferResult', `Set "${key}" = "${value}"`);
+            } catch (error) {
+                log(`Failed to set buffer: ${error.message}`, 'error');
+                showResult('bufferResult', `Failed to set: ${error.message}`, true);
+            }
+        }
+
+        async function getBuffer() {
+            try {
+                const key = document.getElementById('bufferKey').value;
+                
+                if (!key) {
+                    showResult('bufferResult', 'Please enter a key', true);
+                    return;
+                }
+                
+                log(`Getting buffer: ${key}`);
+                const value = await client.get(key);
+                log(`Buffer value: ${value}`);
+                showResult('bufferResult', `Get "${key}" = "${value}"`);
+            } catch (error) {
+                log(`Failed to get buffer: ${error.message}`, 'error');
+                showResult('bufferResult', `Failed to get: ${error.message}`, true);
+            }
+        }
+
+        async function deleteBuffer() {
+            try {
+                const key = document.getElementById('bufferKey').value;
+                
+                if (!key) {
+                    showResult('bufferResult', 'Please enter a key', true);
+                    return;
+                }
+                
+                log(`Deleting buffer: ${key}`);
+                const deleted = await client.delete(key);
+                log(`Buffer deleted: ${deleted}`);
+                showResult('bufferResult', `Delete "${key}": ${deleted ? 'Success' : 'Not found'}`);
+            } catch (error) {
+                log(`Failed to delete buffer: ${error.message}`, 'error');
+                showResult('bufferResult', `Failed to delete: ${error.message}`, true);
+            }
+        }
+
+        async function existsBuffer() {
+            try {
+                const key = document.getElementById('bufferKey').value;
+                
+                if (!key) {
+                    showResult('bufferResult', 'Please enter a key', true);
+                    return;
+                }
+                
+                log(`Checking if buffer exists: ${key}`);
+                const exists = await client.exists(key);
+                log(`Buffer exists: ${exists}`);
+                showResult('bufferResult', 'Exists "' + key + '": ' + (exists ? 'Yes' : 'No'));
+            } catch (error) {
+                log(`Failed to check buffer existence: ${error.message}`, 'error');
+                showResult('bufferResult', `Failed to check: ${error.message}`, true);
+            }
+        }
+
+        async function listKeys() {
+            try {
+                log('Listing all keys...');
+                const keys = await client.keys();
+                log(`Found ${keys.length} keys: ${keys.join(', ')}`);
+                
+                if (keys.length === 0) {
+                    showResult('bufferList', 'No keys found');
+                } else {
+                    const listHtml = keys.map(k => `<div>• ${k}</div>`).join('');
+                    showResult('bufferList', `<strong>Keys:</strong><br>${listHtml}`);
+                }
+            } catch (error) {
+                log(`Failed to list keys: ${error.message}`, 'error');
+                showResult('bufferList', `Failed to list: ${error.message}`, true);
+            }
+        }
+
+        async function getStats() {
+            try {
+                log('Getting pool stats...');
+                const stats = await client.stats();
+                log(`Pool stats: ${JSON.stringify(stats)}`);
+                showResult('bufferList', `<strong>Pool Stats:</strong><br>
+                    Pool: ${stats.name}<br>
+                    Client ID: ${stats.client_id}<br>
+                    Server Mode: ${stats.server_mode}<br>
+                    Key Count: ${stats.key_count}`);
+            } catch (error) {
+                log(`Failed to get stats: ${error.message}`, 'error');
+                showResult('bufferList', `Failed to get stats: ${error.message}`, true);
+            }
+        }
+
+        // Initialize
+        log('Fixed demo loaded. Uses latzero-web2.js with corrected join_pool message structure.');
+        log('Click "Connect" to start testing process registration in server TUI.');
+    </script>
+</body>
+</html>
