@@ -1,11 +1,10 @@
 /**
- * LatZero Web Client - Combined Implementation (Fixed)
+ * LatZero Web Client
+ * AUTHOR: BRAHMAI (https://brahmai.in)
  * 
  * A comprehensive browser-compatible client that combines:
  * - Direct WebSocket connection and buffer operations from latzero-web-direct.js
  * - Process pool functionality from latzero-web.js
- * 
- * FIXED: Correct join_pool message structure for server compatibility
  */
 
 (function(global) {
