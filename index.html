@@ -356,8 +356,9 @@
                 setTimeout(async () => {
                     try {
                         const processes = await client.process.list();
-                        log('Current processes: ' + processes.join(', '));
-                        if (processes.length > 0) {
+                        const pids = Object.keys(processes);
+                        log('Current processes: ' + pids.join(', '));
+                        if (pids.length > 0) {
                             log('SUCCESS: Process is now visible in server TUI!');
                         }
                     } catch (err) {
@@ -419,12 +420,16 @@
             try {
                 log('Listing all processes...');
                 const processes = await client.process.list();
-                log(`Found ${processes.length} processes: ${processes.join(', ')}`);
+                const pids = Object.keys(processes);
+                log(`Found ${pids.length} processes: ${pids.join(', ')}`);
                 
-                if (processes.length === 0) {
+                if (pids.length === 0) {
                     showResult('processList', 'No processes found');
                 } else {
-                    const listHtml = processes.map(p => `<div>• ${p}</div>`).join('');
+                    const listHtml = pids.map(pid => {
+                        const p = processes[pid];
+                        return `<div>• ${pid} <small>(${p.worker_kind}, ${p.worker_count} workers, ${p.queue_depth || 0} queued)</small></div>`;
+                    }).join('');
                     showResult('processList', `<strong>Registered Processes:</strong><br>${listHtml}`);
                 }
             } catch (error) {

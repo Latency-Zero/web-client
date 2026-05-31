@@ -50,7 +50,7 @@
                  *   await client.process.register(myFn, 'override-name');
                  *   await client.process.register(x => x, 'square');  // anon: explicit required
                  */
-                register: async (fn, nameOverride = null) => {
+                register: async (fn, nameOverride = null, options = {}) => {
                     const name = nameOverride || fn.name;
                     if (!name) {
                         throw new Error(
@@ -64,7 +64,12 @@
                     }
                     _self.eventHandlers.get(compoundKey).push(fn);
                     _self._processes.set(name, fn);
-                    await _self.sendRequest('register_process', { process_name: name });
+                    await _self.sendRequest('register_process', {
+                        process_name: name,
+                        worker_kind: options.workerKind || "thread",
+                        min_workers: options.minWorkers || 1,
+                        max_workers: options.maxWorkers || 10,
+                    });
                 },
 
                 /**
@@ -143,7 +148,7 @@
                  */
                 list: async (pattern = null) => {
                     const response = await _self.sendRequest('list_processes', { pattern });
-                    return response.payload?.processes || [];
+                    return response.payload?.processes || {};
                 }
             };
             
