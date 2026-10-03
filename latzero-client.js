@@ -25,7 +25,7 @@
             this.authToken = options.authToken || null;
             this.host = options.host || '127.0.0.1';
             this.port = options.port ?? 14130;
-            this.wsPort = options.wsPort ?? this.port + 1;
+            this.wsPort = options.wsPort;
             this.wsProtocol = options.wsProtocol ?? 'ws';
             this.maxRedirects = options.maxRedirects ?? 4;
             this.timeout = options.timeout ?? 5000;
@@ -227,6 +227,14 @@
 
         get endpoint() {
             return this._endpoint;
+        }
+
+        get wsPort() {
+            return this._wsPort ?? this.port + 1;
+        }
+
+        set wsPort(port) {
+            this._wsPort = port;
         }
 
         _configuredEndpoint() {
@@ -1078,6 +1086,7 @@
             const context = this._context();
             this._requireSocket(context);
             const deadline = this._deadline();
+            const nextAuth = authToken ?? this.authToken;
             const operation = {};
             this._switchOperation = operation;
             this._switching = true;
@@ -1092,14 +1101,14 @@
                 }
                 // Flush replies accepted before quiescence; the switch remains ordered behind them.
                 await this.sendRequest('switch_pool', {
-                    client_id: this.clientId, pool, auth_token: authToken ?? this.authToken
+                    client_id: context.clientId, pool, auth_token: nextAuth
                 }, undefined, {
                     context, deadline, allowSwitch: true,
                     onSend: () => { this._switchTransmitted = true; },
                     onRedirect: (message, entry) => {
                         const flow = this._redirectFlow(this._endpoint, this._entryEndpoint);
                         const target = this._redirectEndpoint(message, entry, flow);
-                        redirected = this._connectionAttempt(deadline, pool, authToken ?? this.authToken, operation);
+                        redirected = this._connectionAttempt(deadline, pool, nextAuth, operation);
                         redirected.redirects = flow;
                         redirected.requestId = message.request_id;
                         redirected.promise.catch(() => {});
@@ -1109,7 +1118,7 @@
                     },
                     onAck: () => {
                         this.poolName = pool;
-                        this.authToken = authToken ?? this.authToken;
+                        this.authToken = nextAuth;
                         this._switching = false;
                         if (pool === context.pool) return; // Idempotent same-pool rejoin retains registrations/routes.
                         this._generation++;

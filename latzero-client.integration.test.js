@@ -99,7 +99,7 @@ test('native WS follows a disposable router, routes full results and switches ow
     const value = { token: id, value: [0, false, null, { nested: 'exact' }] };
     await origin.set(key, value);
     assert.deepEqual(plain(await callee.get(key)), value);
-    await recipient.sendRequest('subscribe', { key });
+    await recipient.sendRequest('subscribe_buffer', { key });
     const updated = event(recipient, 'bufferUpdate', payload => payload.key === key);
     await origin.set(key, { ...value, changed: true });
     assert.equal((await updated).key, key);

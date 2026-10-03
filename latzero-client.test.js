@@ -1564,6 +1564,20 @@ regression('old socket close or error never reconnects, resets backoff or cancel
     ack(entry, await joinRequest(entry));
     await again;
     assert.equal(entry.sent.length, 2, 'Only caller-intended HELLO/JOIN, never process advertisement or effect replay');
+    client.disconnect();
+    client.port = 17130;
+    assert.equal(client.wsPort, 17131);
+    const changed = client.connect();
+    const changedEntry = h.sockets.at(-1);
+    assert.equal(changedEntry.url, 'ws://127.0.0.1:17131/');
+    ack(changedEntry, await joinRequest(changedEntry));
+    await changed;
+    client.disconnect();
+    client.wsPort = 19131;
+    client.port = 19130;
+    assert.equal(client.wsPort, 19131);
+    client.port = 20130;
+    assert.equal(client.wsPort, 19131, 'An explicit WS listener does not derive from later TCP entry changes');
 });
 
 regression('old asynchronous replies and result hooks stay generation-fenced through redirect reconnection', async t => {
@@ -1723,4 +1737,19 @@ regression('switch redirect deadline, auth rejection and intentional cancellatio
     result(ws, call, 7);
     await waiting.done;
     assert.equal(waiting.value.payload.value, 7);
+
+    const secured = h.create({ authToken: 'original-auth' });
+    const { ws: source } = await connect(h, secured);
+    const switched = secured.switchPool('new-pool');
+    await checkpoint();
+    const request = source.sent[0];
+    assert.equal(request.payload.auth_token, 'original-auth');
+    secured.authToken = 'changed-after-switch-send';
+    source.receive(redirectMessage(request));
+    const owner = h.sockets.at(-1);
+    const joining = await joinRequest(owner);
+    assert.equal(joining.payload.auth_token, 'original-auth', 'The original requested auth is captured across redirects');
+    ack(owner, joining);
+    await switched;
+    assert.equal(secured.authToken, 'original-auth');
 });
