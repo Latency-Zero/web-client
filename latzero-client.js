@@ -24,7 +24,10 @@
             this.poolName = pool;
             this.authToken = options.authToken || null;
             this.host = options.host || '127.0.0.1';
-            this.port = options.port || 14130;
+            this.port = options.port ?? 14130;
+            this.wsPort = options.wsPort ?? this.port + 1;
+            this.wsProtocol = options.wsProtocol ?? 'ws';
+            this.maxRedirects = options.maxRedirects ?? 4;
             this.timeout = options.timeout ?? 5000;
             this.maxPendingRequests = options.maxPendingRequests ?? 256;
             this.maxBatchSize = options.maxBatchSize ?? 128;
@@ -48,6 +51,7 @@
             this._generation = 0;
             this._requestSequence = 0;
             this._connecting = null;
+            this._endpoint = null;
             this._reconnectTimer = null;
             this._intentionalDisconnect = false;
             this._outbox = [];
@@ -57,6 +61,7 @@
             this._handlerWaiters = new Set();
             this._activeBatches = 0;
             this._switching = false;
+            this._switchOperation = null;
             this._deferredNotifications = [];
             this._deferredNotificationBytes = 0;
 
@@ -75,6 +80,10 @@
             if (!Number.isSafeInteger(this.maxReconnectAttempts) || this.maxReconnectAttempts < 0) {
                 throw new RangeError('maxReconnectAttempts must be a nonnegative safe integer');
             }
+            if (!Number.isSafeInteger(this.maxRedirects) || this.maxRedirects < 0 || this.maxRedirects > 16) {
+                throw new RangeError('maxRedirects must be a safe integer between 0 and 16');
+            }
+            this._configuredEndpoint();
             
             // Process pool state
             this._processes = new Map(); // short process name -> handler and registration context
@@ -197,51 +206,155 @@
         }
         
         connect() {
-            if (this.connected && this.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
             if (this._connecting) return this._connecting.promise;
+            if (this.connected && this.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
             if (this.ws) this._closeConnection(this._error('connection_lost', 'Previous socket is not open'));
             this._intentionalDisconnect = false;
             clearTimeout(this._reconnectTimer);
             this._reconnectTimer = null;
 
+            const attempt = this._connectionAttempt(this._deadline(), this.poolName, this.authToken);
+            try {
+                const endpoint = this._configuredEndpoint();
+                attempt.redirects = this._redirectFlow(endpoint);
+                this._openConnection(attempt, endpoint);
+            } catch (error) {
+                this._closeConnection(error);
+            }
+            return attempt.promise;
+        }
+
+        get endpoint() {
+            return this._endpoint;
+        }
+
+        _configuredEndpoint() {
+            return this._makeEndpoint(this.host, this.port, this.wsPort, this.wsProtocol);
+        }
+
+        _makeEndpoint(host, port, wsPort, protocol) {
+            for (const [key, value] of [['port', port], ['wsPort', wsPort]]) {
+                if (!Number.isInteger(value) || value < 1 || value > 65535) {
+                    throw new RangeError(`${key} must be an integer between 1 and 65535`);
+                }
+            }
+            if (protocol !== 'ws' && protocol !== 'wss') throw new TypeError('wsProtocol must be ws or wss');
+            if (typeof host !== 'string' || !host || host.trim() !== host || /[/\\?#@%]/.test(host)) {
+                throw new TypeError('host must be a hostname or numeric IP address, not a URL');
+            }
+            const authority = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+            const url = new URL(`${protocol}://${authority}:${wsPort}/`);
+            if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+                throw new TypeError('host must not contain URL credentials, paths or query strings');
+            }
+            return Object.freeze({ host, port, wsPort, protocol, url: url.href });
+        }
+
+        _loopbackHost(host, allowLocalhost = false) {
+            if (typeof host !== 'string') return null;
+            if (allowLocalhost && host.toLowerCase() === 'localhost') return 'localhost';
+            const parts = host.split('.');
+            if (parts.length === 4 && parts[0] === '127' &&
+                parts.every(part => /^(0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255)) return host;
+            const address = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+            if (!address.includes(':') || !/^[0-9a-f:]+$/i.test(address)) return null;
+            try {
+                return new URL(`http://[${address}]/`).hostname === '[::1]' ? '::1' : null;
+            } catch (_) { return null; }
+        }
+
+        _redirectFlow(endpoint) {
+            const initial = this._configuredEndpoint();
+            const visited = new Set([endpoint.url, initial.url]);
+            if (this._loopbackHost(initial.host, true) === 'localhost') {
+                for (const host of ['127.0.0.1', '::1']) {
+                    visited.add(this._makeEndpoint(host, initial.port, initial.wsPort, initial.protocol).url);
+                }
+            }
+            return { initial, visited, hops: 0, metadata: null };
+        }
+
+        _redirectEndpoint(message, entry, flow) {
+            const payload = message.payload;
+            if (!payload || payload.protocol !== 'pool_redirect_v1' || message.client_id !== entry.context.clientId ||
+                typeof entry.membershipPool !== 'string' || !entry.membershipPool ||
+                message.pool !== entry.membershipPool || payload.pool !== entry.membershipPool ||
+                !Number.isSafeInteger(payload.pod_count) || payload.pod_count <= 0 ||
+                !Number.isSafeInteger(payload.pod_index) || payload.pod_index < 0 || payload.pod_index >= payload.pod_count ||
+                typeof payload.cluster_id !== 'string' || !payload.cluster_id || payload.cluster_id.length > 512) {
+                throw this._error('invalid_redirect', 'Invalid pool redirect identity, protocol or owner metadata');
+            }
+            const host = this._loopbackHost(payload.host);
+            const routerHost = this._loopbackHost(payload.router_host);
+            if (!host || !routerHost || !this._loopbackHost(flow.initial.host, true)) {
+                throw this._error('unsafe_redirect', 'Pool redirects require a loopback entry and numeric loopback endpoints');
+            }
+            const validPort = port => Number.isInteger(port) && port >= 1 && port <= 65535;
+            if (!validPort(payload.port) || !validPort(payload.router_port) ||
+                (payload.ws_port !== null && !validPort(payload.ws_port)) ||
+                (payload.router_ws_port !== null && !validPort(payload.router_ws_port))) {
+                throw this._error('invalid_redirect', 'Invalid pool redirect port metadata');
+            }
+            if (payload.ws_port === null) throw this._error('redirect_unavailable', 'Owner has no WebSocket listener');
+            const metadata = JSON.stringify([payload.cluster_id, payload.pod_count, routerHost,
+                payload.router_port, payload.router_ws_port]);
+            if (flow.metadata !== null && flow.metadata !== metadata) {
+                throw this._error('invalid_redirect', 'Pool redirect cluster metadata changed within one operation');
+            }
+            if (this.maxRedirects === 0) throw this._error('redirect_required', 'Pool redirects are disabled');
+            if (flow.hops >= this.maxRedirects) throw this._error('redirect_limit', 'Pool redirect hop limit exceeded');
+            // Only the explicit WS port is followed. The reply cannot supply a URL or change the caller's scheme.
+            const endpoint = this._makeEndpoint(host, payload.port, payload.ws_port, flow.initial.protocol);
+            if (flow.visited.has(endpoint.url)) throw this._error('redirect_cycle', 'Pool redirect endpoint was already visited');
+            flow.metadata = metadata;
+            flow.hops++;
+            flow.visited.add(endpoint.url);
+            return endpoint;
+        }
+
+        _connectionAttempt(deadline, pool, authToken, switchOperation = null) {
             let resolve, reject;
             const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
-            const attempt = { promise, resolve, reject, timer: null };
+            const attempt = { promise, resolve, reject, deadline, pool, authToken, switchOperation, timer: null };
             this._connecting = attempt;
+            attempt.timer = setTimeout(() => {
+                if (this._connecting === attempt) {
+                    this._closeConnection(this._error('timeout', 'Connection handshake timeout'));
+                }
+            }, Math.max(0, deadline - this._now()));
+            return attempt;
+        }
+
+        _openConnection(attempt, endpoint) {
+            if (this._connecting !== attempt || this._intentionalDisconnect) return;
             try {
-                const deadline = this._deadline();
-                const ws = new WebSocket(`ws://${this.host}:${this.port + 1}`);
+                if (this._now() >= attempt.deadline) throw this._error('timeout', 'Connection handshake timeout');
+                const ws = new WebSocket(endpoint.url);
                 this.ws = ws;
+                this._endpoint = endpoint;
                 this.connected = false;
                 this._generation++;
                 const context = this._context();
-                attempt.timer = setTimeout(() => {
-                    this._closeConnection(this._error('timeout', 'Connection handshake timeout'), ws);
-                }, Math.max(0, deadline - this._now()));
 
                 ws.onopen = () => {
                     if (!this._isCurrent(context) || this._connecting !== attempt) return;
-                    const options = { deadline, context, allowHandshake: true };
-                    this.sendRequest('hello', {}, null, options)
-                        .then(() => this.sendRequest('join_pool', {
-                            client_id: this.clientId,
-                            pool: context.pool,
-                            auth_token: this.authToken
-                        }, undefined, {
-                            ...options,
-                            onAck: () => {
-                                this.connected = true;
-                                this.reconnectAttempts = 0;
-                            }
-                        }))
+                    const options = { deadline: attempt.deadline, context, allowHandshake: true, allowSwitch: true };
+                    this.sendRequest('hello', { capabilities: this.maxRedirects > 0 ? ['pool_redirect_v1'] : [] }, null, options)
                         .then(() => {
-                            if (!this._isCurrent(context) || this._connecting !== attempt) return;
-                            clearTimeout(attempt.timer);
-                            this._connecting = null;
-                            this.connected = true;
-                            this.reconnectAttempts = 0;
-                            resolve();
-                            this.dispatchEvent(new CustomEvent('connect'));
+                            if (!this._isCurrent(context) || this._connecting !== attempt) {
+                                throw this._error('connection_lost', 'Connection handshake was superseded');
+                            }
+                            return this.sendRequest('join_pool', {
+                                client_id: context.clientId, pool: attempt.pool, auth_token: attempt.authToken
+                            }, undefined, {
+                                ...options,
+                                onAck: () => this._completeConnection(attempt, context),
+                                onRedirect: (message, entry) => {
+                                    const target = this._redirectEndpoint(message, entry, attempt.redirects);
+                                    this._retireSocket(context, entry.type === 'switch_pool' ? 'pool_switched' : 'connection_lost', message.request_id);
+                                    this._openConnection(attempt, target);
+                                }
+                            });
                         })
                         .catch(error => this._closeConnection(error, ws));
                 };
@@ -257,7 +370,34 @@
             } catch (error) {
                 this._closeConnection(error);
             }
-            return promise;
+        }
+
+        _completeConnection(attempt, context) {
+            if (!this._isCurrent(context) || this._connecting !== attempt || this._intentionalDisconnect) return;
+            clearTimeout(attempt.timer);
+            this._connecting = null;
+            this.poolName = attempt.pool;
+            this.authToken = attempt.authToken;
+            this.connected = true;
+            this.reconnectAttempts = 0;
+            if (attempt.switchOperation === this._switchOperation) {
+                this._switching = false;
+                this._switchTransmitted = false;
+            }
+            attempt.resolve();
+            this.dispatchEvent(new CustomEvent('connect'));
+        }
+
+        _retireSocket(context, code, skipRequestId) {
+            this.connected = false;
+            this.ws = null;
+            this._endpoint = null;
+            this._generation++;
+            this._clearConnectionWork(this._error(code, 'Request cancelled by pool redirect'), skipRequestId);
+            this._switchTransmitted = false;
+            if (context.ws.readyState < WebSocket.CLOSING) {
+                try { context.ws.close(); } catch (_) { /* Superseded socket callbacks are already fenced. */ }
+            }
         }
 
         _now() {
@@ -278,12 +418,13 @@
         }
 
         _context() {
-            return { ws: this.ws, generation: this._generation, pool: this.poolName, clientId: this.clientId };
+            return { ws: this.ws, generation: this._generation,
+                pool: this._connecting ? this._connecting.pool : this.poolName, clientId: this.clientId };
         }
 
         _isCurrent(context) {
             return !!context.ws && context.ws === this.ws && context.generation === this._generation &&
-                context.pool === this.poolName;
+                context.pool === (this._connecting ? this._connecting.pool : this.poolName);
         }
 
         _requireSocket(context, allowHandshake = false) {
@@ -299,26 +440,17 @@
             const hadConnection = !!this.ws || !!attempt || this.connected;
             this.connected = false;
             this.ws = null;
+            this._endpoint = null;
             this._generation++;
             this._connecting = null;
+            this._switchOperation = null;
+            this._switching = false;
+            this._switchTransmitted = false;
             if (attempt) {
                 clearTimeout(attempt.timer);
                 attempt.reject(error);
             }
-            clearTimeout(this._sendTimer);
-            this._sendTimer = null;
-            for (const frame of this._outbox) clearTimeout(frame.timer);
-            this._outbox = [];
-            this._queuedBytes = 0;
-            for (const id of Array.from(this.pending.keys())) this._settle(id, error);
-            for (const waiter of this._handlerWaiters) {
-                clearTimeout(waiter.timer);
-                waiter.reject(error);
-            }
-            this._handlerWaiters.clear();
-            this._processes.clear();
-            this._deferredNotifications = [];
-            this._deferredNotificationBytes = 0;
+            this._clearConnectionWork(error);
             if (socket && socket.readyState < WebSocket.CLOSING) {
                 try { socket.close(); } catch (_) { /* The connection is already fenced locally. */ }
             }
@@ -329,6 +461,25 @@
                 this.dispatchEvent(new CustomEvent('disconnect'));
             }
             this._scheduleReconnect();
+        }
+
+        _clearConnectionWork(error, skipRequestId = null) {
+            clearTimeout(this._sendTimer);
+            this._sendTimer = null;
+            for (const frame of this._outbox) clearTimeout(frame.timer);
+            this._outbox = [];
+            this._queuedBytes = 0;
+            for (const id of Array.from(this.pending.keys())) {
+                if (id !== skipRequestId) this._settle(id, error);
+            }
+            for (const waiter of this._handlerWaiters) {
+                clearTimeout(waiter.timer);
+                waiter.reject(error);
+            }
+            this._handlerWaiters.clear();
+            this._processes.clear();
+            this._deferredNotifications = [];
+            this._deferredNotificationBytes = 0;
         }
 
         _scheduleReconnect() {
@@ -367,6 +518,20 @@
             const matches = entry && entry.sent && entry.context.ws === context.ws &&
                 entry.context.generation === context.generation &&
                 (message.pool == null || message.pool === entry.context.pool || entry.type === 'switch_pool');
+
+            if (type === 'redirect') {
+                if (!entry || !entry.sent || entry.context.ws !== context.ws ||
+                    entry.context.generation !== context.generation ||
+                    !['join_pool', 'switch_pool'].includes(entry.type) || !entry.onRedirect) return;
+                try {
+                    if (this._now() >= entry.deadline) throw this._error('timeout', 'Request timeout');
+                    entry.onRedirect(message, entry);
+                    this._settle(request_id, null, message);
+                } catch (error) {
+                    this._settle(request_id, error);
+                }
+                return;
+            }
 
             if (matches && (type === 'ack' || type === 'error' || (type === 'app_result' && entry.kind === 'result')) &&
                 this._now() >= entry.deadline) {
@@ -696,7 +861,8 @@
                     requestId = this.generateRequestId();
                     const rpc = type === 'call_app' || type === 'call_process';
                     const kind = rpc && (!payload?.response_to || payload.response_to === this.clientId) ? 'result' : 'ack';
-                    entry = { resolve, reject, type, kind, context, deadline, sent: false, timer: null, onAck: options.onAck };
+                    entry = { resolve, reject, type, kind, context, deadline, sent: false, timer: null,
+                        onAck: options.onAck, onRedirect: options.onRedirect, membershipPool: payload?.pool };
                     this.pending.set(requestId, entry);
                     entry.timer = setTimeout(() => this._settle(requestId,
                         this._error('timeout', 'Request timeout')), Math.max(0, deadline - this._now()));
@@ -900,18 +1066,34 @@
             const context = this._context();
             this._requireSocket(context);
             const deadline = this._deadline();
+            const operation = {};
+            this._switchOperation = operation;
             this._switching = true;
             this._switchTransmitted = false;
             this._deferredNotifications = [];
             this._deferredNotificationBytes = 0;
+            let redirected = null;
             try {
                 await this._drainHandlers(deadline);
+                if (this._switchOperation !== operation || !this._isCurrent(context)) {
+                    throw this._error('connection_lost', 'Pool switch was cancelled');
+                }
                 // Flush replies accepted before quiescence; the switch remains ordered behind them.
                 await this.sendRequest('switch_pool', {
                     client_id: this.clientId, pool, auth_token: authToken ?? this.authToken
                 }, undefined, {
                     context, deadline, allowSwitch: true,
                     onSend: () => { this._switchTransmitted = true; },
+                    onRedirect: (message, entry) => {
+                        const flow = this._redirectFlow(this._endpoint);
+                        const target = this._redirectEndpoint(message, entry, flow);
+                        redirected = this._connectionAttempt(deadline, pool, authToken ?? this.authToken, operation);
+                        redirected.redirects = flow;
+                        redirected.promise.catch(() => {});
+                        this._retireSocket(context, 'pool_switched', message.request_id);
+                        this.eventHandlers.clear();
+                        this._openConnection(redirected, target);
+                    },
                     onAck: () => {
                         this.poolName = pool;
                         this.authToken = authToken ?? this.authToken;
@@ -940,22 +1122,27 @@
                         }
                     }
                 });
+                if (redirected) await redirected.promise;
             } catch (error) {
-                if (this._switchTransmitted && error.code !== 'pool_switched' && error.code !== 'connection_lost' &&
+                if (this._switchOperation === operation && this._switchTransmitted &&
+                    error.code !== 'pool_switched' && error.code !== 'connection_lost' &&
                     error.uncertain !== false) {
                     // The switch may have committed remotely; do not continue with ambiguous membership.
                     this._closeConnection(error, context.ws);
                 }
                 throw error;
             } finally {
-                this._switching = false;
-                this._switchTransmitted = false;
-                this._flushOutbox();
-                const notifications = this._deferredNotifications;
-                this._deferredNotifications = [];
-                this._deferredNotificationBytes = 0;
-                for (const item of notifications) {
-                    if (this._isCurrent(item.context)) this.handleServerMessage(item.message, item.context);
+                if (this._switchOperation === operation) {
+                    this._switchOperation = null;
+                    this._switching = false;
+                    this._switchTransmitted = false;
+                    this._flushOutbox();
+                    const notifications = this._deferredNotifications;
+                    this._deferredNotifications = [];
+                    this._deferredNotificationBytes = 0;
+                    for (const item of notifications) {
+                        if (this._isCurrent(item.context)) this.handleServerMessage(item.message, item.context);
+                    }
                 }
             }
         }
