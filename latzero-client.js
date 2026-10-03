@@ -271,7 +271,7 @@
                     visited.add(this._makeEndpoint(host, initial.port, initial.wsPort, initial.protocol).url);
                 }
             }
-            return { initial, visited, hops: 0, metadata: null };
+            return { initial, protocol: endpoint.protocol, visited, hops: 0, metadata: null };
         }
 
         _redirectEndpoint(message, entry, flow) {
@@ -304,7 +304,7 @@
             if (this.maxRedirects === 0) throw this._error('redirect_required', 'Pool redirects are disabled');
             if (flow.hops >= this.maxRedirects) throw this._error('redirect_limit', 'Pool redirect hop limit exceeded');
             // Only the explicit WS port is followed. The reply cannot supply a URL or change the caller's scheme.
-            const endpoint = this._makeEndpoint(host, payload.port, payload.ws_port, flow.initial.protocol);
+            const endpoint = this._makeEndpoint(host, payload.port, payload.ws_port, flow.protocol);
             if (flow.visited.has(endpoint.url)) throw this._error('redirect_cycle', 'Pool redirect endpoint was already visited');
             flow.metadata = metadata;
             flow.hops++;
@@ -536,7 +536,11 @@
 
             if (matches && (type === 'ack' || type === 'error' || (type === 'app_result' && entry.kind === 'result')) &&
                 this._now() >= entry.deadline) {
-                this._settle(request_id, this._error('timeout', 'Request timeout'));
+                const error = this._error('timeout', 'Request timeout');
+                const failure = this._settle(request_id, error);
+                if (this._connecting && ['hello', 'join_pool'].includes(entry.type)) {
+                    this._closeConnection(failure || error, context.ws);
+                }
                 if (type === 'app_result') this.handleServerMessage(message, context);
                 return;
             }
