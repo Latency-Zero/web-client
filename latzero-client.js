@@ -52,6 +52,7 @@
             this._requestSequence = 0;
             this._connecting = null;
             this._endpoint = null;
+            this._entryEndpoint = null;
             this._reconnectTimer = null;
             this._intentionalDisconnect = false;
             this._outbox = [];
@@ -263,8 +264,7 @@
             } catch (_) { return null; }
         }
 
-        _redirectFlow(endpoint) {
-            const initial = this._configuredEndpoint();
+        _redirectFlow(endpoint, initial = this._configuredEndpoint()) {
             const visited = new Set([endpoint.url, initial.url]);
             if (this._loopbackHost(initial.host, true) === 'localhost') {
                 for (const host of ['127.0.0.1', '::1']) {
@@ -332,6 +332,7 @@
                 const ws = new WebSocket(endpoint.url);
                 this.ws = ws;
                 this._endpoint = endpoint;
+                this._entryEndpoint = attempt.redirects.initial;
                 this.connected = false;
                 this._generation++;
                 const context = this._context();
@@ -392,6 +393,7 @@
             this.connected = false;
             this.ws = null;
             this._endpoint = null;
+            this._entryEndpoint = null;
             this._generation++;
             this._clearConnectionWork(this._error(code, 'Request cancelled by pool redirect'), skipRequestId);
             this._switchTransmitted = false;
@@ -441,6 +443,7 @@
             this.connected = false;
             this.ws = null;
             this._endpoint = null;
+            this._entryEndpoint = null;
             this._generation++;
             this._connecting = null;
             this._switchOperation = null;
@@ -1094,7 +1097,7 @@
                     context, deadline, allowSwitch: true,
                     onSend: () => { this._switchTransmitted = true; },
                     onRedirect: (message, entry) => {
-                        const flow = this._redirectFlow(this._endpoint);
+                        const flow = this._redirectFlow(this._endpoint, this._entryEndpoint);
                         const target = this._redirectEndpoint(message, entry, flow);
                         redirected = this._connectionAttempt(deadline, pool, authToken ?? this.authToken, operation);
                         redirected.redirects = flow;

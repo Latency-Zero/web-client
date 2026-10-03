@@ -1310,6 +1310,16 @@ regression('redirects reject unsafe hosts and remote-to-loopback SSRF while acce
         ack(owner, await joinRequest(owner));
         await ready;
     }
+    const remote = h.create({ host: 'remote.example' });
+    const { ws } = await connect(h, remote);
+    remote.host = '127.0.0.1'; // Future explicit reconnect intent must not authorize this existing remote socket.
+    const switched = observe(remote.switchPool('new-pool'));
+    await checkpoint();
+    const count = h.sockets.length;
+    ws.receive(redirectMessage(ws.sent[0]));
+    await switched.done;
+    assert.equal(switched.error.code, 'unsafe_redirect');
+    assert.equal(h.sockets.length, count);
 });
 
 regression('redirect validates protocol, identity, pool, owner and WS ports without TCP fallback or scheme changes', async t => {
