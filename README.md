@@ -17,6 +17,9 @@ Include the client in your HTML:
 const client = new LatZeroWebClient('latzero://my-web-client', 'my-pool', {
     host: '127.0.0.1',
     port: 14130,
+    // wsPort: 14131, // Override when public WS is not TCP + 1
+    // wsProtocol: 'ws', // 'wss' only for an existing TLS-capable endpoint
+    maxRedirects: 4, // Integer range 0..16; 0 disables redirects
     authToken: null, // optional
     timeout: 5000, // total request deadline in ms, including queued send and RPC completion
     maxReconnectAttempts: 5, // auto-reconnect settings
@@ -103,7 +106,53 @@ client.disconnect();
 
 Open `index.html` in a web browser to see a complete interactive demo of the web client functionality.
 
-Configure the daemon to allow the page's exact origin. For a local `file://` demo, opt in explicitly with `latzero-server --ws-origin null`; `null` is an origin string, not a trusted browser identity. For an HTTP page, use its actual origin, for example `--ws-origin http://127.0.0.1:8080`. The browser connects to `ws://host:(port + 1)`; HTTPS/mixed-content and remote TLS are outside this client phase.
+Configure the daemon to allow the page's exact origin. For a local `file://` demo, opt in explicitly with `latzero-server --ws-origin null`; `null` is an origin string, not a trusted browser identity. For an HTTP page, use its actual origin, for example `--ws-origin http://127.0.0.1:8080`. The browser connects to the explicit `wsPort`, or TCP `port + 1` by default.
+
+The page's Origin does not change when the WS destination changes. In pod mode,
+every pod must allow that same explicit page origin, including its port when present;
+ephemeral pod destination ports are not additional page origins. The SDK adds no
+JSON origin field and cannot bypass browser mixed-content restrictions.
+
+## Pool-Affine Pods
+
+Use this SDK revision with a server explicitly started using `--pods N`; older
+clients receive `redirect_required` instead of being silently routed. Hello
+advertises `capabilities: ['pool_redirect_v1']`. Only a sent, correlated join/switch
+reply can redirect; unrelated or unsolicited replies never move the socket or
+consume another pending request. Classic-server hello/join ACKs remain supported
+without automatically changing protocols.
+
+Configure the public entry, not individual pods. `host`, TCP `port`, `wsPort`
+(default `port + 1`) and `wsProtocol` remain the entry for later explicit reconnects.
+Read-only `client.endpoint` describes the actual socket as a frozen object
+(`host`, `port`, `wsPort`, `protocol`, `url`), or `null` after disconnect. Owner
+redirects use only `ws_port`, never TCP + 1 as a fallback or reply-supplied URLs,
+paths, query strings or credentials.
+
+Automatic discovery requires an initially configured numeric loopback host or
+`localhost`, and numeric loopback targets. Remote replies cannot open local
+endpoints. Protocol, exact client/requested pool, owner index/count, ports, stable
+cluster metadata and visited endpoints are validated. The default maximum is four
+hops; `maxRedirects` is configurable from 0 to 16. One original `timeout` covers
+WS opening, hello, join and all hops. Readiness and the shared `connect()` promise
+complete only at the final owner ACK. Intermediate closure does not schedule a
+reconnect, reset backoff or cancel the new owner handshake.
+
+An owner-changing `switchPool()` drains admitted handlers, rejects old pending
+work, clears registrations, and performs hello/join with the same client ID and
+requested pool auth under the original switch deadline. Same-pool rejoin ACKs
+retain handlers and pending routes. No effect RPC or registration is replayed;
+re-register explicitly after a membership change. `disconnect()` cancels all hops
+and scheduled reconnect timers. Running JavaScript cannot be forcibly interrupted,
+but old-generation replies cannot reach the new connection.
+
+Local discovery is a trust boundary, not authenticated pod discovery: a configured
+local router can select another numeric loopback port. Use a trusted local entry.
+The final owner checks auth again, and its correlated denial is returned unchanged.
+The SDK preserves the existing `ws`/`wss` scheme without upgrades or downgrades.
+Local pod mode has no WSS listener; neither the client nor server creates TLS.
+`wsProtocol: 'wss'` is only for an existing TLS-capable endpoint, and an HTTPS
+page's browser mixed-content policy remains in force.
 
 ## API Reference
 
@@ -118,7 +167,10 @@ Configure the daemon to allow the page's exact origin. For a local `file://` dem
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `host` | `'127.0.0.1'` | WebSocket host |
-| `port` | `14130` | TCP base port; browser uses this port plus one |
+| `port` | `14130` | Public TCP port; default WS port is TCP + 1 |
+| `wsPort` | `port + 1` | Explicit public WebSocket port, integer 1..65535 |
+| `wsProtocol` | `'ws'` | Configured `ws` or `wss`; no automatic TLS changes |
+| `maxRedirects` | `4` | Bounded join/switch redirects, integer 0..16; 0 disables capability/following |
 | `authToken` | `null` | Optional pool authentication token |
 | `timeout` | `5000` | Total request/connect/switch deadline in milliseconds |
 | `autoConnect` | `true` | Start connection on construction |
@@ -193,7 +245,7 @@ The web client uses WebSocket for browser compatibility. It requires:
 - All data is automatically JSON serialized/deserialized
 - Application handlers run on the browser main thread; promises are awaited, but CPU-blocking code cannot be preempted and a never-settling handler retains an admission slot
 - Async replies retain their incoming pool/socket/generation; disconnected or superseded work never replies through a new socket/pool
-- After a successful switch or reconnect, re-register processes explicitly; subscriptions/notifications are not replayed, so re-read state after reconnect
+- After a membership-changing switch or reconnect, re-register processes explicitly; same-pool rejoin ACKs retain handlers. Subscriptions/notifications are not replayed, so re-read state after reconnect
 
 ## Stabilization Release Notes
 
@@ -205,6 +257,26 @@ The web client uses WebSocket for browser compatibility. It requires:
 
 ## Tests
 
-Run `node --test latzero-client.test.js`. The dependency-free suite evaluates the actual browser script in a Node VM using deterministic WebSocket mocks, fake monotonic timers, explicit promise/event-loop barriers and bounded test deadlines. It installs nothing and uses no daemon, default cache or live ports.
+Run `node --unhandled-rejections=strict --test latzero-client.test.js`. The 77-case
+dependency-free suite retains the original 65 cases and adds 12 redirect regression
+groups. It evaluates the actual browser script in a VM using mocked WebSockets,
+fake monotonic timers and explicit barriers. It installs nothing and uses no daemon,
+default cache or live ports.
 
-Real-browser WebSocket integration is a separate, unrun gate: use an explicitly origin-authorized daemon with temporary data/ports and verify browser-to-Python/Node self/direct/third-party RPC, close/backpressure and pool-switch behavior. The mock suite and `index.html` demo do not substitute for that gate.
+The native Node WebSocket integration test is opt-in and never starts a server.
+Point it only at an already-started disposable pod server with a temporary data
+directory, explicit nondefault ports and two pools owned by different pods:
+
+```powershell
+$env:LATZERO_WEB_POD_TEST = '{"host":"127.0.0.1","port":25130,"wsPort":26130,"pool":"temporary-pool-a","switchPool":"temporary-pool-b"}'
+node --unhandled-rejections=strict --test latzero-client.integration.test.js
+```
+
+These example ports are placeholders, not defaults to run against. Node's native
+`WebSocket` (Node 22+) is required; an absent explicit fixture skips the test. The
+test changes only temporary data on that fixture. Optional JSON fields `authToken`,
+`switchAuthToken` and `timeout` support secured fixtures.
+
+Node native WS/VM integration does not verify a browser engine's actual Origin,
+mixed-content policy or bufferedAmount behavior. An origin-authorized native-page
+gate and the demo remain separate from these automated tests.

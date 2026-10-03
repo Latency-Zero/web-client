@@ -10,6 +10,7 @@ The LatZero Web Client is a comprehensive browser-compatible client that provide
 - **Process Pool**: Register, call, broadcast, and manage distributed processes
 - **Event System**: Real-time event handling and cross-process communication
 - **WebSocket Connection**: Direct WebSocket connection with auto-reconnect
+- **Pool-Affine Pods**: Validated local join/switch redirects with bounded hops and final-owner readiness
 - **Cross-Language Compatibility**: Works seamlessly with Node.js and Python clients
 
 ## Installation
@@ -35,6 +36,8 @@ The LatZero Web Client is a comprehensive browser-compatible client that provide
 const client = new LatZeroWebClient('latzero://my-web-client', 'my-pool', {
     host: '127.0.0.1',
     port: 14130,
+    // wsPort: 14131, // Override if the public WS listener is not TCP + 1
+    maxRedirects: 4,
     autoConnect: true
 });
 
@@ -65,11 +68,37 @@ new LatZeroWebClient(dsn, pool, options)
 - `pool` (string): Pool name to join
 - `options` (object): Optional configuration; full protective limits are listed in `README.md`.
 - `host` (string): Server host (default: `'127.0.0.1'`).
-- `port` (number): Base port (default: `14130`); WebSocket uses `port + 1`.
+- `port` (number): Public TCP port (default: `14130`).
+- `wsPort` (number): Explicit public WebSocket port (default: `port + 1`), integer 1..65535.
+- `wsProtocol` (string): `'ws'` (default) or `'wss'`, preserved across redirects without TLS upgrades/downgrades.
+- `maxRedirects` (number): Bounded join/switch hops (default: `4`, integer 0..16); `0` disables the capability and following.
 - `timeout` (number): One total deadline in milliseconds for queued send, ACK and RPC result (default: `5000`).
 - `autoConnect` (boolean): Auto-connect on creation (default: `true`); await `client.connect()` before requests.
 - `maxReconnectAttempts` (number): Connection-only reconnect budget (default: `5`, `0` disables).
 - `reconnectDelay` / `maxReconnectDelay` (number): Initial/capped backoff milliseconds (defaults: `1000` / `30000`), with jitter; resets only after successful hello/join.
+
+### Pod Mode
+
+Use this SDK revision for a server explicitly started using `--pods N`. Hello
+advertises `pool_redirect_v1`; only a sent, correlated `join_pool` or `switch_pool`
+can redirect. Unrelated request types and unsolicited redirects cannot move the
+socket or consume pending work. Older SDKs receive `redirect_required`; ordinary
+classic-server ACKs remain supported without automatically upgrading protocols.
+
+Configure the public entry point, not individual pods. Its `host`, TCP `port` and
+`wsPort` remain stable for a future explicit reconnect. Read-only `client.endpoint`
+is the frozen actual owner socket (`host`, `port`, `wsPort`, `protocol`, `url`), or
+`null` after disconnect. Owner discovery uses only the reply's explicit `ws_port`,
+never TCP + 1 as a fallback or arbitrary URLs, paths, query strings or credentials.
+
+The configured host must already be numeric loopback or `localhost` to follow.
+Targets must be numeric loopback (canonical IPv4 127/8 or IPv6 `::1`), never
+hostnames or private/remote addresses. Protocol, exact requested client/pool,
+owner index/count, ports, stable cluster metadata and visited endpoints are
+validated. Four hops are allowed by default, bounded by `maxRedirects`. A local
+router is still trusted to select local ports; discovery is not authentication.
+Use a trusted entry and supply pool auth explicitly. The final owner checks auth
+again and its denial is returned unchanged, without retrying auth or replaying work.
 
 ### Buffer Operations
 
@@ -308,6 +337,11 @@ Connect to the server.
 
 Concurrent calls share one connection promise. Readiness starts only after hello ACK and join ACK; opening the WebSocket alone is not readiness. Failed handshake/open is fenced, timers are cleared, and no effectful requests or process registrations are automatically replayed on reconnect.
 
+In pod mode this promise and the original timeout cover public WS opening, hello,
+join and all redirects. `connected` becomes true only at the final owner ACK.
+Intermediate closure does not schedule reconnect, reset backoff or cancel the new
+owner. Later explicit `connect()` uses the configured public entry again.
+
 ```javascript
 await client.connect();
 ```
@@ -316,6 +350,8 @@ await client.connect();
 Disconnect from the server.
 
 Cancels pending waiters/unsent frames, closes the socket and cancels/disables auto-reconnect until explicit `connect()`. No unobserved leave-pool request is created.
+All redirect continuations are canceled as well; an old continuation cannot send a
+join or cancel a new explicitly connected generation.
 
 ```javascript
 client.disconnect();
@@ -327,6 +363,15 @@ Switch to a different pool.
 New requests/handlers pause while admitted handlers drain under the same total deadline used for the switch ACK. Replies retain their old pool/socket/generation. A successful ACK commits membership synchronously before further messages, cancels old-pool waiters, and clears old-pool application handlers/process registrations. Re-register explicitly in the new pool. A pre-send quiescence timeout or explicit protocol rejection preserves the old context; an uncertain transmitted switch timeout closes the connection instead of guessing membership.
 
 A same-pool switch is an idempotent rejoin: registrations, application handlers and pending routes remain intact.
+
+If the new pool has a different pod owner, the SDK quiesces the old context and
+performs hello/join on the new owner with the same client ID and requested auth.
+The original deadline includes draining, the switch request and every new handshake
+hop. Readiness and the switch promise complete only at the final owner ACK. Old
+pending work is rejected with the existing `code`, `request_id`, `uncertain` fields;
+old asynchronous replies cannot reach the new connection. Registrations are not
+re-advertised, and effect RPCs are never replayed. Re-register explicitly after the
+membership change.
 
 ```javascript
 await client.switchPool('new-pool', 'auth-token');
@@ -488,9 +533,16 @@ Open `index.html` in your browser to try the demo; it is not an automated confor
 
 **"Connection issues"**
 - Check server is running on correct host/port
-- Verify WebSocket server is on port+1
+- Verify `wsPort`, or the default TCP port + 1, is the public WebSocket listener
 - Authorize the exact HTTP page origin, or explicitly the `null` origin for a file page
 - Check for firewall issues
+
+**"Origin or mixed-content rejection"**
+- Allow the page's exact origin on every pod, including its page port when present, for example `http://127.0.0.1:8080`
+- The page Origin stays unchanged across WS endpoints; ephemeral pod destination ports are not additional origins
+- A direct `file://` page sends `Origin: null`; the user must explicitly opt in to that literal origin string
+- Local pod mode is plain WS, not WSS; the SDK creates no TLS server and cannot bypass HTTPS-page mixed-content restrictions
+- `wsProtocol: 'wss'` only works with an existing TLS-capable endpoint and never downgrades on redirect
 
 ### Debug Mode
 
@@ -523,6 +575,16 @@ Ensure processes appear in the server TUI to verify proper registration and visi
 
 ## Regression Tests
 
-Run `node --test latzero-client.test.js` without external installs. Tests evaluate the real browser script in a VM with mocked WebSockets, fake monotonic timers, explicit barriers and bounded waits. They cover correlation, both ACK/result orders, async/serialization faults, handler replacement/switch affinity, fractional seconds, admission/backpressure and reconnect shutdown.
+Run `node --unhandled-rejections=strict --test latzero-client.test.js` without
+external installs. All original 65 cases remain, with 12 new redirect regression
+groups. The actual script runs in a VM with mocked WebSockets and deterministic
+timers, covering security, one deadline across hops, cancellation, stale generations,
+owner-switch auth and no replay alongside the existing protocol/lifetime cases.
 
-Real-browser WS integration remains a separately gated, unrun check with a temporary-data/port daemon and explicit browser origin. VM mocks and the demo do not verify native browser networking, real bufferedAmount behavior or Python/Node interoperability in a browser.
+`latzero-client.integration.test.js` adds an opt-in native Node WebSocket test for
+an already-running disposable pod fixture. It requires the explicit
+`LATZERO_WEB_POD_TEST` JSON configuration documented in `README.md`; it never
+starts a server or chooses default ports/data. Without that fixture or native
+WebSocket it skips. Actual browser Origin/mixed-content behavior and real browser
+bufferedAmount still require a separately authorized native-page gate; Node WS/VM
+tests and the demo do not substitute for it.
