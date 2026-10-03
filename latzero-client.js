@@ -351,7 +351,7 @@
                                 onAck: () => this._completeConnection(attempt, context),
                                 onRedirect: (message, entry) => {
                                     const target = this._redirectEndpoint(message, entry, attempt.redirects);
-                                    this._retireSocket(context, entry.type === 'switch_pool' ? 'pool_switched' : 'connection_lost', message.request_id);
+                                    this._retireSocket(context, attempt.switchOperation ? 'pool_switched' : 'connection_lost', message.request_id);
                                     this._openConnection(attempt, target);
                                 }
                             });
@@ -528,7 +528,8 @@
                     entry.onRedirect(message, entry);
                     this._settle(request_id, null, message);
                 } catch (error) {
-                    this._settle(request_id, error);
+                    const failure = this._settle(request_id, error);
+                    this._closeConnection(failure || error, context.ws);
                 }
                 return;
             }
@@ -544,7 +545,10 @@
             if (matches && type === 'error') {
                 const error = this._error(payload?.code || 'server_error', payload?.message || 'Server error');
                 if (entry.type === 'switch_pool') error.uncertain = false;
-                this._settle(request_id, error);
+                const failure = this._settle(request_id, error);
+                if (this._connecting && ['hello', 'join_pool'].includes(entry.type)) {
+                    this._closeConnection(failure || error, context.ws);
+                }
                 return;
             }
             if (matches && type === 'ack') {
@@ -839,6 +843,7 @@
                 failure.request_id = requestId;
                 failure.uncertain = error.uncertain ?? entry.sent;
                 entry.reject(failure);
+                return failure;
             } else entry.resolve(message);
         }
 
