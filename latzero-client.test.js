@@ -108,8 +108,8 @@ function sandbox(t, options = {}) {
     vm.runInContext(source, context, { filename: 'latzero-client.js' });
     const Client = context.window.LatZeroWebClient;
     const clients = [];
-    const create = extra => {
-        const client = new Client('latzero://browser', 'old-pool', {
+    const create = (extra, pool = 'old-pool') => {
+        const client = new Client('latzero://browser', pool, {
             autoConnect: false, timeout: 100, maxReconnectAttempts: 0, ...options, ...extra
         });
         clients.push(client);
@@ -147,6 +147,29 @@ function invocation(ws, id, event = 'compute', data = {}, type = 'call_app', poo
         type, request_id: id, client_id: 'caller', pool,
         payload: type === 'call_app' ? { event, data } : { process_id: event, data }
     });
+}
+
+function redirectMessage(request, payload = {}, envelope = {}) {
+    const pool = request.payload.pool;
+    return {
+        type: 'redirect', request_id: request.request_id, client_id: request.client_id, pool,
+        payload: {
+            protocol: 'pool_redirect_v1', host: '127.0.0.1', port: 21130, ws_port: 22130,
+            pool, pod_index: 0, pod_count: 2, router_host: '127.0.0.1', router_port: 14130,
+            router_ws_port: 14131, cluster_id: 'mock-cluster', ...payload
+        }, ...envelope
+    };
+}
+
+async function joinRequest(ws) {
+    ws.open();
+    assert.equal(ws.sent[0].type, 'hello');
+    assert.equal(ws.sent[0].pool, null);
+    ack(ws, ws.sent[0]);
+    await checkpoint();
+    const request = ws.sent.at(-1);
+    assert.equal(request.type, 'join_pool');
+    return request;
 }
 
 async function connect(h, client = h.create()) {
@@ -1126,4 +1149,538 @@ regression('raw request deadline override cannot disable the finite timeout boun
     assert.equal(ws.sent.length, 0);
     assert.equal(client.pending.size, 0);
     assert.equal(h.clock.timers.size, 0);
+});
+
+regression('pool redirect advertises capability, uses distinct WS ports and resolves readiness only at final owner', async t => {
+    const h = sandbox(t);
+    const client = h.create({ port: 15130, wsPort: 18130, authToken: 'pool-secret' });
+    const connects = [], disconnects = [];
+    client.addEventListener('connect', () => connects.push(client.endpoint.url));
+    client.addEventListener('disconnect', () => disconnects.push(true));
+    client.on('compute', () => 42);
+    const ready = client.connect();
+    const state = observe(ready);
+    const router = h.sockets.at(-1);
+    assert.equal(router.url, 'ws://127.0.0.1:18130/');
+    const request = await joinRequest(router);
+    assert.deepEqual(router.sent[0].payload.capabilities, ['pool_redirect_v1']);
+    router.receive(redirectMessage(request, {
+        url: 'wss://evil.example/path?token=secret', path: '/admin', query: 'token=secret', auth: 'other'
+    }));
+    const owner = h.sockets.at(-1);
+    assert.notEqual(owner, router);
+    assert.equal(router.readyState, h.MockWebSocket.CLOSED);
+    assert.equal(owner.url, 'ws://127.0.0.1:22130/');
+    assert.equal(client.endpoint.port, 21130);
+    assert.equal(client.endpoint.wsPort, 22130);
+    assert.equal(Object.isFrozen(client.endpoint), true);
+    assert.equal(client.port, 15130);
+    assert.equal(client.wsPort, 18130);
+    assert.equal(client.connect(), ready);
+    assert.equal(client.connected, false);
+    assert.equal(connects.length, 0);
+    const joined = await joinRequest(owner);
+    assert.equal(joined.client_id, 'browser');
+    assert.equal(joined.pool, 'old-pool');
+    assert.equal(joined.payload.auth_token, 'pool-secret');
+    assert.equal(state.status, 'pending');
+    assert.equal(client.connected, false);
+    ack(owner, joined);
+    invocation(owner, 'after-final-owner');
+    await ready;
+    await checkpoint();
+    assert.equal(owner.sent.at(-1).payload.value, 42, 'Initial local handlers survive discovery, without advertising them');
+    assert.deepEqual(connects, ['ws://127.0.0.1:22130/']);
+    assert.deepEqual(disconnects, []);
+    assert.equal(h.clock.timers.size, 0);
+});
+
+regression('one original deadline covers public open, hello, join and every redirect hop', async t => {
+    const h = sandbox(t);
+    for (const stage of ['open', 'hello', 'join', 'late-redirect']) {
+        const client = h.create();
+        const state = observe(client.connect());
+        const router = h.sockets.at(-1);
+        await h.clock.advance(30);
+        router.open();
+        await h.clock.advance(20);
+        ack(router, router.sent[0]);
+        await checkpoint();
+        const request = router.sent[1];
+        if (stage === 'late-redirect') {
+            h.clock.now += 50; // The monotonic fence wins even if timer execution is delayed.
+            router.receive(redirectMessage(request));
+        } else {
+            router.receive(redirectMessage(request));
+            const owner = h.sockets.at(-1);
+            await h.clock.advance(20);
+            if (stage !== 'open') owner.open();
+            if (stage === 'join') {
+                ack(owner, owner.sent[0]);
+                await checkpoint();
+                assert.equal(owner.sent[1].type, 'join_pool');
+            }
+            await h.clock.advance(29);
+            assert.equal(state.status, 'pending');
+            await h.clock.advance(1);
+        }
+        await state.done;
+        assert.equal(state.error.code, 'timeout', stage);
+        assert.equal(client.connected, false);
+        assert.equal(client._connecting, null);
+        assert.equal(h.clock.timers.size, 0);
+    }
+});
+
+regression('redirect cycles and configured hop limits are finite; zero disables the capability', async t => {
+    const h = sandbox(t);
+    for (const [options, target, expected] of [
+        [{}, 14131, 'redirect_cycle'],
+        [{ host: 'localhost' }, 14131, 'redirect_cycle'],
+        [{}, 22130, 'redirect_cycle'],
+        [{ maxRedirects: 1 }, 23130, 'redirect_limit'],
+        [{ maxRedirects: 0 }, 22130, 'redirect_required']
+    ]) {
+        const client = h.create(options);
+        const state = observe(client.connect());
+        let ws = h.sockets.at(-1);
+        let request = await joinRequest(ws);
+        if (options.maxRedirects === 0) {
+            assert.deepEqual(ws.sent[0].payload.capabilities, []);
+        } else {
+            ws.receive(redirectMessage(request));
+            ws = h.sockets.at(-1);
+            request = await joinRequest(ws);
+        }
+        ws.receive(redirectMessage(request, { ws_port: target }));
+        await state.done;
+        assert.equal(state.error.code, expected);
+        assert.equal(state.error.request_id, request.request_id);
+        assert.equal(client.connected, false);
+    }
+    const client = h.create();
+    assert.equal(client.maxRedirects, 4);
+    const state = observe(client.connect());
+    let ws = h.sockets.at(-1);
+    let request = await joinRequest(ws);
+    for (let hop = 0; hop < 4; hop++) {
+        ws.receive(redirectMessage(request, { ws_port: 24000 + hop }));
+        ws = h.sockets.at(-1);
+        request = await joinRequest(ws);
+        assert.equal(state.status, 'pending');
+    }
+    ws.receive(redirectMessage(request, { ws_port: 24004 }));
+    await state.done;
+    assert.equal(state.error.code, 'redirect_limit');
+    for (const maxRedirects of [-1, 17, true, 1.5, Infinity, NaN]) {
+        assert.throws(() => h.create({ maxRedirects }), /maxRedirects must be/);
+    }
+});
+
+regression('redirects reject unsafe hosts and remote-to-loopback SSRF while accepting canonical numeric loopback', async t => {
+    const h = sandbox(t);
+    const denied = [
+        [{ host: 'remote.example' }, '127.0.0.1'], [{ host: '198.51.100.5' }, '127.0.0.1'],
+        [{}, 'localhost'], [{}, '127.0.0.1.evil.example'], [{}, '192.168.1.2'], [{}, '0.0.0.0'],
+        [{}, '127.1'], [{}, '127.00.0.1'], [{}, '0x7f000001'], [{}, '2130706433'],
+        [{}, '127.0.0.1/admin'], [{}, '127.0.0.1?token=secret'], [{}, 'user@127.0.0.1'],
+        [{}, '127.0.0.1\\evil'], [{}, '127.0.0.1%2fadmin'], [{}, '::ffff:127.0.0.1'],
+        [{}, 'fe80::1%lo'], [{}, ' ::1'], [{}, null]
+    ];
+    for (const [options, host] of denied) {
+        const client = h.create(options);
+        const state = observe(client.connect());
+        const ws = h.sockets.at(-1);
+        const request = await joinRequest(ws);
+        const count = h.sockets.length;
+        ws.receive(redirectMessage(request, { host }));
+        await state.done;
+        assert.equal(state.error.code, 'unsafe_redirect', String(host));
+        assert.equal(h.sockets.length, count, 'Unsafe metadata creates no additional socket');
+    }
+    for (const [host, expected] of [
+        ['127.0.0.2', '127.0.0.2'], ['::1', '[::1]'], ['[::1]', '[::1]'], ['0:0:0:0:0:0:0:1', '[::1]']
+    ]) {
+        const client = h.create({ host: 'localhost' });
+        const ready = client.connect();
+        const ws = h.sockets.at(-1);
+        ws.receive(redirectMessage(await joinRequest(ws), { host }));
+        const owner = h.sockets.at(-1);
+        assert.equal(owner.url, `ws://${expected}:22130/`);
+        ack(owner, await joinRequest(owner));
+        await ready;
+    }
+});
+
+regression('redirect validates protocol, identity, pool, owner and WS ports without TCP fallback or scheme changes', async t => {
+    const h = sandbox(t);
+    const invalid = [
+        [{ protocol: 'pool_redirect_v2' }], [{ pool: 'wrong-pool' }], [{}, { pool: 'wrong-pool' }],
+        [{}, { client_id: 'other-client' }], [{ pod_count: 0 }], [{ pod_count: true }], [{ pod_count: 2.5 }],
+        [{ pod_index: -1 }], [{ pod_index: 2 }], [{ pod_index: 0.5 }], [{ cluster_id: '' }],
+        [{ router_host: 'remote.example' }, {}, 'unsafe_redirect'], [{ router_port: 0 }], [{ router_ws_port: '14131' }]
+    ];
+    for (const key of ['port', 'ws_port']) {
+        for (const value of [0, 65536, -1, true, 2.5, '22130', undefined]) invalid.push([{ [key]: value }]);
+    }
+    invalid.push([{ ws_port: null }, {}, 'redirect_unavailable']);
+    for (const [payload, envelope = {}, expected = 'invalid_redirect'] of invalid) {
+        const client = h.create();
+        const state = observe(client.connect());
+        const router = h.sockets.at(-1);
+        const request = await joinRequest(router);
+        const count = h.sockets.length;
+        router.receive(redirectMessage(request, payload, envelope));
+        await state.done;
+        assert.equal(state.error.code, expected, JSON.stringify([payload, envelope]));
+        assert.equal(h.sockets.length, count);
+    }
+    const client = h.create({ wsProtocol: 'wss' });
+    const ready = client.connect();
+    const router = h.sockets.at(-1);
+    assert.equal(router.url, 'wss://127.0.0.1:14131/');
+    router.receive(redirectMessage(await joinRequest(router), {
+        scheme: 'ws', ws_url: 'ws://evil.example/path?auth=secret', path: '/different', auth_token: 'injected'
+    }));
+    const owner = h.sockets.at(-1);
+    assert.equal(owner.url, 'wss://127.0.0.1:22130/', 'No downgrade, upgrade or server-supplied URL fields');
+    ack(owner, await joinRequest(owner));
+    await ready;
+
+    const changed = h.create();
+    const state = observe(changed.connect());
+    const first = h.sockets.at(-1);
+    first.receive(redirectMessage(await joinRequest(first)));
+    const second = h.sockets.at(-1);
+    second.receive(redirectMessage(await joinRequest(second), { ws_port: 23130, cluster_id: 'another-cluster' }));
+    await state.done;
+    assert.equal(state.error.code, 'invalid_redirect');
+    for (const options of [{ port: 0 }, { port: 65535 }, { wsPort: '14131' }, { wsPort: 65536 },
+        { wsProtocol: 'https' }, { host: 'user@127.0.0.1' }, { host: '127.0.0.1/path' }]) {
+        assert.throws(() => h.create(options));
+    }
+});
+
+regression('owner auth denial and legacy redirect_required preserve errors with no protocol upgrade or replay', async t => {
+    const h = sandbox(t);
+    for (const code of ['auth_failed', 'redirect_required']) {
+        const client = h.create({ authToken: 'original-auth' });
+        const state = observe(client.connect());
+        let ws = h.sockets.at(-1);
+        let request = await joinRequest(ws);
+        if (code === 'auth_failed') {
+            ws.receive(redirectMessage(request));
+            ws = h.sockets.at(-1);
+            request = await joinRequest(ws);
+            assert.equal(request.payload.auth_token, 'original-auth');
+        }
+        ws.receive({ type: 'error', request_id: request.request_id, payload: { code, message: 'Denied by server' } });
+        ws.close(); // Immediate EOF must not replace the correlated error with connection_lost.
+        await state.done;
+        assert.equal(state.error.code, code);
+        assert.equal(state.error.request_id, request.request_id);
+        assert.equal(state.error.uncertain, true);
+        assert.equal(client.connected, false);
+        assert.ok(ws.sent.every(message => ['hello', 'join_pool'].includes(message.type)));
+        assert.equal(h.clock.timers.size, 0);
+    }
+    const legacy = h.create();
+    const { ws } = await connect(h, legacy); // Legacy hello ACK need not echo the new optional capability.
+    assert.equal(legacy.connected, true);
+    assert.equal(ws.url, 'ws://127.0.0.1:14131/');
+    assert.equal(h.sockets.at(-1), ws);
+});
+
+regression('redirect is not a push or reply for other pending types, unsent work or uncorrelated IDs', async t => {
+    const h = sandbox(t);
+    const client = h.create();
+    const ready = client.connect();
+    const router = h.sockets.at(-1);
+    router.open();
+    router.receive(redirectMessage(router.sent[0]));
+    assert.equal(client.pending.size, 1, 'Hello remains ACK-only');
+    ack(router, router.sent[0]);
+    await checkpoint();
+    const joining = router.sent[1];
+    router.receive(redirectMessage(joining, {}, { request_id: 'not-pending' }));
+    assert.equal(h.sockets.at(-1), router);
+    assert.equal(client.connected, false);
+    ack(router, joining);
+    await ready;
+    router.sent.length = 0;
+    const hooks = [];
+    client.addEventListener('app_result', event => hooks.push(event.detail));
+    for (const type of ['get_buffer', 'call_process', 'register_process', 'hello']) {
+        const state = observe(client.sendRequest(type, { process_id: 'callee:echo' }));
+        const request = router.sent.at(-1);
+        router.receive(redirectMessage(request, { pool: 'old-pool' }, { pool: 'old-pool' }));
+        await checkpoint();
+        assert.equal(state.status, 'pending', type);
+        assert.equal(h.sockets.at(-1), router);
+        if (type === 'call_process') result(router, request, 42);
+        else ack(router, request);
+        await state.done;
+        assert.equal(state.status, 'resolved');
+    }
+    router.bufferedAmount = client.maxBufferedAmount;
+    const queued = observe(client.get('queued'));
+    const requestId = Array.from(client.pending.keys())[0];
+    router.receive(redirectMessage({ request_id: requestId, client_id: 'browser', payload: { pool: 'old-pool' } }));
+    assert.equal(queued.status, 'pending');
+    router.bufferedAmount = 0;
+    await h.clock.advance(10);
+    ack(router, router.sent.at(-1), { exists: false });
+    await queued.done;
+    assert.equal(hooks.length, 0);
+
+    const nullPool = h.create({}, null);
+    const nullReady = nullPool.connect();
+    const nullSocket = h.sockets.at(-1);
+    const nullJoin = await joinRequest(nullSocket);
+    assert.equal(nullJoin.pool, null);
+    assert.equal(nullJoin.payload.pool, null);
+    ack(nullSocket, nullJoin);
+    await nullReady;
+    assert.equal(nullPool.poolName, null);
+});
+
+regression('intentional disconnect cancels every redirect continuation and reconnect timer without fencing new intent', async t => {
+    const h = sandbox(t, { maxReconnectAttempts: 3, reconnectDelay: 20 });
+    for (const stage of ['owner-open', 'after-hello']) {
+        const client = h.create();
+        const state = observe(client.connect());
+        const router = h.sockets.at(-1);
+        router.receive(redirectMessage(await joinRequest(router)));
+        const abandoned = h.sockets.at(-1);
+        if (stage === 'after-hello') {
+            abandoned.open();
+            ack(abandoned, abandoned.sent[0]);
+        }
+        client.disconnect();
+        const next = client.connect();
+        const current = h.sockets.at(-1);
+        assert.equal(current.url, 'ws://127.0.0.1:14131/');
+        abandoned.onopen?.();
+        abandoned.onclose?.();
+        abandoned.fail();
+        ack(current, await joinRequest(current));
+        await next;
+        await state.done;
+        assert.equal(state.error.code, 'connection_lost');
+        assert.equal(client.connected, true);
+        assert.equal(abandoned.sent.length, stage === 'after-hello' ? 1 : 0, 'No stale JOIN continuation');
+        const count = h.sockets.length;
+        client.disconnect();
+        await h.clock.advance(1000);
+        assert.equal(h.sockets.length, count);
+        assert.equal(h.clock.timers.size, 0);
+    }
+    const client = h.create();
+    const failed = observe(client.connect());
+    h.sockets.at(-1).fail();
+    await failed.done;
+    assert.notEqual(client._reconnectTimer, null);
+    client.disconnect();
+    const count = h.sockets.length;
+    await h.clock.advance(1000);
+    assert.equal(h.sockets.length, count);
+    assert.equal(client._reconnectTimer, null);
+});
+
+regression('old socket close or error never reconnects, resets backoff or cancels the next redirect generation', async t => {
+    const h = sandbox(t, { maxReconnectAttempts: 3, reconnectDelay: 20 });
+    const client = h.create();
+    const errors = [], disconnects = [], connects = [];
+    client.addEventListener('error', event => errors.push(event.detail));
+    client.addEventListener('disconnect', () => disconnects.push(true));
+    client.addEventListener('connect', () => connects.push(true));
+    const failed = observe(client.connect());
+    h.sockets.at(-1).fail();
+    await failed.done;
+    await h.clock.advance(20);
+    const router = h.sockets.at(-1);
+    const ready = client.connect();
+    router.receive(redirectMessage(await joinRequest(router)));
+    const owner = h.sockets.at(-1);
+    for (let i = 0; i < 3; i++) {
+        router.onclose?.();
+        router.fail();
+    }
+    assert.equal(client.reconnectAttempts, 1);
+    assert.equal(client._reconnectTimer, null);
+    assert.equal(client.connect(), ready);
+    const request = await joinRequest(owner);
+    assert.equal(client.reconnectAttempts, 1, 'Even owner hello ACK is not final readiness');
+    ack(owner, request);
+    await ready;
+    assert.equal(client.reconnectAttempts, 0);
+    router.onclose?.();
+    router.fail();
+    assert.equal(client.connected, true);
+    assert.equal(errors.length, 1);
+    assert.equal(disconnects.length, 1);
+    assert.equal(connects.length, 1);
+    assert.equal(h.clock.timers.size, 0);
+    client.disconnect();
+    const again = client.connect();
+    const entry = h.sockets.at(-1);
+    assert.equal(entry.url, router.url, 'Explicit reconnect starts at the configured router, not the prior owner');
+    ack(entry, await joinRequest(entry));
+    await again;
+    assert.equal(entry.sent.length, 2, 'Only caller-intended HELLO/JOIN, never process advertisement or effect replay');
+});
+
+regression('old asynchronous replies and result hooks stay generation-fenced through redirect reconnection', async t => {
+    const h = sandbox(t);
+    const { client, ws: old } = await connect(h);
+    const gate = deferred();
+    const hooks = [];
+    client.addEventListener('app_result', event => hooks.push(event.detail));
+    client.on('compute', () => gate.promise);
+    invocation(old, 'stale-async-hop');
+    await checkpoint();
+    const pending = observe(client.process.call('callee:compute'));
+    const call = old.sent.at(-1);
+    const context = client._context();
+    old.close();
+    await pending.done;
+    const ready = client.connect();
+    const router = h.sockets.at(-1);
+    router.receive(redirectMessage(await joinRequest(router)));
+    const owner = h.sockets.at(-1);
+    ack(owner, await joinRequest(owner));
+    await ready;
+    owner.sent.length = 0;
+    gate.resolve(42);
+    await checkpoint();
+    result(old, call, 99);
+    client.handleMessageObject({ type: 'app_result', request_id: call.request_id, payload: { value: 99 } }, context);
+    client.handleMessage('invalid-old-json', context);
+    assert.equal(owner.sent.length, 0);
+    assert.equal(old.sent.some(message => message.request_id === 'stale-async-hop'), false);
+    assert.equal(hooks.length, 0);
+    assert.equal(client.connected, true);
+    const current = client.process.call('callee:compute');
+    const request = owner.sent.at(-1);
+    result(owner, request, null, { type: 'ValueError', message: 'Application failure' });
+    const envelope = await current;
+    assert.equal(envelope.type, 'app_result');
+    assert.deepEqual(plain(envelope.payload.error), { type: 'ValueError', message: 'Application failure' });
+    result(owner, { ...request, request_id: 'unsolicited-current' }, false);
+    assert.equal(hooks[0].request_id, 'unsolicited-current');
+    assert.equal(hooks[0].payload.value, false);
+});
+
+regression('cross-owner switch drains old handlers, cancels old effects and rejoins with same identity and new auth', async t => {
+    const h = sandbox(t);
+    const { client, ws: old } = await connect(h);
+    const gate = deferred();
+    const registered = client.process.register(() => gate.promise, 'compute');
+    ack(old, old.sent[0]);
+    await registered;
+    client.on('notice', () => {});
+    old.sent.length = 0;
+    const waiting = observe(client.process.call('callee:compute'));
+    const oldCall = old.sent.at(-1);
+    invocation(old, 'old-admitted-hop', 'browser:compute');
+    await checkpoint();
+    const seen = [];
+    client.addEventListener('presence', event => seen.push(event.detail));
+    const switched = observe(client.switchPool('new-pool', 'new-auth'));
+    await h.clock.advance(40);
+    assert.equal(old.sent.some(message => message.type === 'switch_pool'), false);
+    gate.resolve('old-result');
+    await checkpoint();
+    const request = old.sent.at(-1);
+    assert.equal(request.type, 'switch_pool');
+    assert.equal(old.sent.at(-2).request_id, 'old-admitted-hop');
+    assert.equal(old.sent.at(-2).pool, 'old-pool');
+    old.receive({ type: 'presence_update', pool: 'old-pool', payload: { action: 'left' } });
+    old.receive(redirectMessage(request));
+    const owner = h.sockets.at(-1);
+    old.onclose?.();
+    old.fail();
+    await waiting.done;
+    assert.equal(waiting.error.code, 'pool_switched');
+    assert.equal(waiting.error.request_id, oldCall.request_id);
+    assert.equal(waiting.error.uncertain, true);
+    assert.equal(client._processes.size, 0);
+    assert.equal(client.eventHandlers.size, 0);
+    assert.equal(client._deferredNotifications.length, 0);
+    assert.equal(client.connected, false);
+    assert.equal(client.poolName, 'old-pool', 'Public membership commits only at final ACK');
+    const ready = client.connect();
+    await h.clock.advance(20);
+    const joined = await joinRequest(owner);
+    assert.equal(joined.client_id, 'browser');
+    assert.equal(joined.pool, 'new-pool');
+    assert.equal(joined.payload.pool, 'new-pool');
+    assert.equal(joined.payload.auth_token, 'new-auth');
+    assert.equal(switched.status, 'pending');
+    ack(owner, joined);
+    invocation(owner, 'new-owner-no-advertisement', 'browser:compute', {}, 'call_app', 'new-pool');
+    owner.receive({ type: 'presence_update', pool: 'new-pool', payload: { action: 'joined' } });
+    await switched.done;
+    await ready;
+    await checkpoint();
+    assert.equal(client.poolName, 'new-pool');
+    assert.equal(client.authToken, 'new-auth');
+    assert.equal(owner.sent.at(-1).payload.error.type, 'NoHandler');
+    assert.equal(owner.sent.some(message => ['call_process', 'register_process'].includes(message.type)), false);
+    assert.deepEqual(seen, [{ action: 'joined' }]);
+    result(old, oldCall, 'stale-result');
+    assert.equal(client.connected, true);
+    assert.equal(h.clock.timers.size, 0);
+});
+
+regression('switch redirect deadline, auth rejection and intentional cancellation cannot leave ambiguous or new-gen work', async t => {
+    const h = sandbox(t);
+    for (const outcome of ['timeout', 'auth_failed', 'disconnect']) {
+        const { client, ws: old } = await connect(h);
+        const state = observe(client.switchPool('new-pool', 'new-auth'));
+        await checkpoint();
+        await h.clock.advance(60);
+        old.receive(redirectMessage(old.sent[0]));
+        const owner = h.sockets.at(-1);
+        await h.clock.advance(30);
+        const request = await joinRequest(owner);
+        if (outcome === 'timeout') await h.clock.advance(10);
+        else if (outcome === 'auth_failed') {
+            owner.receive({ type: 'error', request_id: request.request_id, payload: { code: 'auth_failed' } });
+            owner.close();
+        } else {
+            client.disconnect();
+            const next = client.connect();
+            const current = h.sockets.at(-1);
+            ack(current, await joinRequest(current));
+            await next;
+            ack(owner, request);
+            old.onclose?.();
+        }
+        await state.done;
+        assert.equal(state.error.code, outcome === 'disconnect' ? 'connection_lost' : outcome);
+        assert.equal(client.poolName, 'old-pool');
+        assert.equal(client.authToken, null);
+        assert.equal(client._switching, false);
+        assert.equal(client._connecting, null);
+        assert.equal(client.connected, outcome === 'disconnect');
+        assert.equal(h.clock.timers.size, 0);
+    }
+    const { client, ws } = await connect(h);
+    const registered = client.process.register(() => 42, 'compute');
+    ack(ws, ws.sent[0]);
+    await registered;
+    const waiting = observe(client.process.call('callee:compute'));
+    const call = ws.sent.at(-1);
+    const same = client.switchPool('old-pool');
+    await checkpoint();
+    ws.receive({ type: 'presence_update', pool: 'old-pool', payload: { action: 'rejoined' } });
+    ack(ws, ws.sent.at(-1));
+    await same;
+    assert.equal(client._processes.size, 1);
+    assert.equal(client.ws, ws);
+    assert.equal(waiting.status, 'pending');
+    result(ws, call, 7);
+    await waiting.done;
+    assert.equal(waiting.value.payload.value, 7);
 });
