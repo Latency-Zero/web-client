@@ -1347,6 +1347,15 @@ regression('redirect validates protocol, identity, pool, owner and WS ports with
     ack(owner, await joinRequest(owner));
     await ready;
 
+    const switched = client.switchPool('secure-pool');
+    await checkpoint();
+    client.wsProtocol = 'ws'; // Explicit future-entry configuration cannot downgrade the existing switch transport.
+    owner.receive(redirectMessage(owner.sent.at(-1), { ws_port: 23130 }));
+    const secureOwner = h.sockets.at(-1);
+    assert.equal(secureOwner.url, 'wss://127.0.0.1:23130/');
+    ack(secureOwner, await joinRequest(secureOwner));
+    await switched;
+
     const changed = h.create();
     const state = observe(changed.connect());
     const first = h.sockets.at(-1);
@@ -1389,6 +1398,23 @@ regression('owner auth denial and legacy redirect_required preserve errors with 
     assert.equal(legacy.connected, true);
     assert.equal(ws.url, 'ws://127.0.0.1:14131/');
     assert.equal(h.sockets.at(-1), ws);
+
+    const recovering = h.create();
+    let explicit;
+    recovering.addEventListener('error', () => { explicit = recovering.connect(); }, { once: true });
+    const rejected = observe(recovering.connect());
+    const denied = h.sockets.at(-1);
+    const request = await joinRequest(denied);
+    denied.receive({ type: 'error', request_id: request.request_id, payload: { code: 'auth_failed' } });
+    const current = h.sockets.at(-1);
+    assert.notEqual(current, denied);
+    denied.onclose?.();
+    denied.fail();
+    ack(current, await joinRequest(current));
+    await explicit;
+    await rejected.done;
+    assert.equal(rejected.error.code, 'auth_failed');
+    assert.equal(recovering.connected, true, 'Old rejected HELLO/JOIN continuations cannot close an explicit recovery');
 });
 
 regression('redirect is not a push or reply for other pending types, unsent work or uncorrelated IDs', async t => {
