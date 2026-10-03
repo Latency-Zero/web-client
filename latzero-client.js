@@ -1098,6 +1098,7 @@
                         const target = this._redirectEndpoint(message, entry, flow);
                         redirected = this._connectionAttempt(deadline, pool, authToken ?? this.authToken, operation);
                         redirected.redirects = flow;
+                        redirected.requestId = message.request_id;
                         redirected.promise.catch(() => {});
                         this._retireSocket(context, 'pool_switched', message.request_id);
                         this.eventHandlers.clear();
@@ -1133,6 +1134,12 @@
                 });
                 if (redirected) await redirected.promise;
             } catch (error) {
+                if (redirected && error.request_id === undefined) {
+                    const failure = this._error(error.code || 'send_failed', error.message || String(error));
+                    failure.request_id = redirected.requestId;
+                    failure.uncertain = true;
+                    error = failure;
+                }
                 if (this._switchOperation === operation && this._switchTransmitted &&
                     error.code !== 'pool_switched' && error.code !== 'connection_lost' &&
                     error.uncertain !== false) {

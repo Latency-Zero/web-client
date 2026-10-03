@@ -98,7 +98,9 @@ owner index/count, ports, stable cluster metadata and visited endpoints are
 validated. Four hops are allowed by default, bounded by `maxRedirects`. A local
 router is still trusted to select local ports; discovery is not authentication.
 Use a trusted entry and supply pool auth explicitly. The final owner checks auth
-again and its denial is returned unchanged, without retrying auth or replaying work.
+again and its denial is returned unchanged, without substituting credentials,
+changing protocols or replaying work. The configured connection-only retry policy
+still applies to a terminal connection failure; it never replays effects or registrations.
 
 ### Buffer Operations
 

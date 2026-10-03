@@ -1666,7 +1666,8 @@ regression('switch redirect deadline, auth rejection and intentional cancellatio
         const state = observe(client.switchPool('new-pool', 'new-auth'));
         await checkpoint();
         await h.clock.advance(60);
-        old.receive(redirectMessage(old.sent[0]));
+        const switching = old.sent[0];
+        old.receive(redirectMessage(switching));
         const owner = h.sockets.at(-1);
         await h.clock.advance(30);
         const request = await joinRequest(owner);
@@ -1685,6 +1686,9 @@ regression('switch redirect deadline, auth rejection and intentional cancellatio
         }
         await state.done;
         assert.equal(state.error.code, outcome === 'disconnect' ? 'connection_lost' : outcome);
+        assert.equal(state.error.uncertain, true);
+        assert.equal(typeof state.error.request_id, 'string');
+        if (outcome !== 'auth_failed') assert.equal(state.error.request_id, switching.request_id);
         assert.equal(client.poolName, 'old-pool');
         assert.equal(client.authToken, null);
         assert.equal(client._switching, false);
