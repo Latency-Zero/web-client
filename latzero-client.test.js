@@ -1627,7 +1627,7 @@ regression('cross-owner switch drains old handlers, cancels old effects and rejo
     assert.equal(client.authToken, 'new-auth');
     assert.equal(owner.sent.at(-1).payload.error.type, 'NoHandler');
     assert.equal(owner.sent.some(message => ['call_process', 'register_process'].includes(message.type)), false);
-    assert.deepEqual(seen, [{ action: 'joined' }]);
+    assert.deepEqual(plain(seen), [{ action: 'joined' }]);
     result(old, oldCall, 'stale-result');
     assert.equal(client.connected, true);
     assert.equal(h.clock.timers.size, 0);
